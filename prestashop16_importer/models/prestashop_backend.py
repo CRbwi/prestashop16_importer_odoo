@@ -27,26 +27,35 @@ class PrestashopBackend(models.Model):
     )
 
     def _create_error_report(self, title, main_error, imported=0, skipped=0, errors=0, context=""):
-        """Helper method to create detailed error notifications"""
+        """Helper method to create detailed error notifications with enhanced debugging info"""
         if errors > 0 or imported == 0:
-            # Create detailed error message
-            error_details = f"""IMPORT SUMMARY:
-• Imported: {imported}
-• Skipped: {skipped} 
-• Errors: {errors}
+            # Create detailed error message with timestamp
+            import datetime
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            error_details = f"""🕐 TIMESTAMP: {timestamp}
 
-ERROR DETAILS:
+📊 IMPORT SUMMARY:
+• ✅ Imported: {imported} new records
+• ⚠️ Skipped: {skipped} (already exist or invalid)
+• ❌ Errors: {errors} failed to process
+
+🔍 ERROR DETAILS:
 {main_error}
 
+💡 CONTEXT & SOLUTIONS:
 {context}
 
-TROUBLESHOOTING STEPS:
-1. Test connection first (use 'Test Connection' button)
-2. Check your internet connection
-3. Verify Prestashop server is running
-4. Check API key permissions in Prestashop admin
-5. Look at Odoo server logs for technical details
-6. Try importing during off-peak hours if server is slow"""
+🛠️ NEXT TROUBLESHOOTING STEPS:
+1. 🔗 Test connection first (use 'Test Connection' button)
+2. 🌐 Check your internet connection stability
+3. 🖥️ Verify Prestashop server is running and responding
+4. 🔑 Check API key permissions in Prestashop admin
+5. 📋 Look at Odoo server logs for technical details
+6. ⏰ Try importing during off-peak hours if server is slow
+7. 📞 Contact system administrator if problem persists
+
+📍 CURRENT STATUS: Import was {('COMPLETED WITH ERRORS' if errors > 0 else 'STOPPED')}"""
 
             return {
                 'type': 'ir.actions.client',
@@ -55,7 +64,7 @@ TROUBLESHOOTING STEPS:
                     'title': title,
                     'message': error_details,
                     'type': 'danger',
-                    'sticky': True,  # Keep error notifications visible
+                    'sticky': True,  # Keep error notifications visible until manually closed
                 }
             }
         else:
@@ -211,8 +220,66 @@ If still failing, check server logs for more details."""
         except Exception as general_error:
             raise UserError(f"Connection test failed: {str(general_error)}")
 
+    def action_test_url_manually(self):
+        """Test only URL accessibility without API authentication"""
+        self.ensure_one()
+        
+        if not self.prestashop_url:
+            raise UserError("Please fill in the Prestashop URL before testing.")
+        
+        # Test different URL combinations
+        base_url = self.prestashop_url.rstrip('/')
+        test_urls = [
+            base_url,
+            f"{base_url}/api",
+            f"{base_url}/webservice",
+            f"{base_url}/api/",
+        ]
+        
+        try:
+            results = []
+            
+            for url in test_urls:
+                try:
+                    response = requests.get(url, timeout=5)
+                    if response.status_code == 200:
+                        if '<?xml' in response.text:
+                            results.append(f"✓ {url} - Returns XML (Good!)")
+                        else:
+                            preview = response.text[:200].replace('\n', ' ')
+                            results.append(f"⚠ {url} - Returns HTML: {preview}...")
+                    elif response.status_code == 401:
+                        results.append(f"✓ {url} - Returns 401 (API endpoint found, needs auth)")
+                    elif response.status_code == 404:
+                        results.append(f"✗ {url} - Returns 404 (Not found)")
+                    else:
+                        results.append(f"⚠ {url} - Returns {response.status_code}")
+                except requests.exceptions.ConnectionError:
+                    results.append(f"✗ {url} - Connection failed")
+                except requests.exceptions.Timeout:
+                    results.append(f"✗ {url} - Timeout")
+                except Exception as e:
+                    results.append(f"✗ {url} - Error: {str(e)}")
+            
+            report = "URL Test Results:\n\n" + "\n".join(results)
+            report += f"""
+
+RECOMMENDATIONS:
+- If any URL returns XML or 401, that's your correct API endpoint
+- If all return HTML, check your .htaccess configuration
+- If connection fails, verify your Prestashop is running
+
+.htaccess should contain:
+RewriteRule ^api/?(.*)$ webservice/dispatcher.php?url=$1 [QSA,L]"""
+            
+            raise UserError(report)
+            
+        except ImportError:
+            # Fallback if requests is not available
+            raise UserError(f"Testing URL: {base_url}/api\n\nPlease manually check if this URL is accessible in your browser.\nIt should return XML or ask for authentication.")
+
     def action_import_customers(self):
-        """Import customers from Prestashop with detailed error handling"""
+        """Import customers from Prestashop with detailed error handling and connection management"""
         self.ensure_one()
         
         # Ensure URL ends with /api
@@ -220,23 +287,29 @@ If still failing, check server logs for more details."""
         if not test_url.endswith('/api'):
             test_url += '/api'
         
+        # Create a session for connection reuse
+        session = requests.Session()
+        session.headers.update({'User-Agent': 'Odoo-Prestashop-Importer/1.0'})
+        
         try:
-            # Get customers list - NO LIMIT to get ALL customers
+            # Get customers list with shorter, more realistic timeout
             customers_url = f"{test_url}/customers?ws_key={self.api_key}"
-            _logger.info("Starting customer import from: %s", customers_url)
+            _logger.info("🚀 Starting customer import from: %s", customers_url)
             
             try:
-                response = requests.get(customers_url, timeout=90)
+                response = session.get(customers_url, timeout=30)  # Reduced to 30 seconds
+                _logger.info("✅ Successfully got customer list in %.2f seconds", response.elapsed.total_seconds())
             except requests.exceptions.Timeout:
                 return self._create_error_report(
                     "❌ TIMEOUT ERROR - Customer Import Failed",
-                    "Connection timeout while getting customer list (>90 seconds)",
+                    "Connection timeout while getting customer list (>30 seconds)",
                     context="""TIMEOUT SOLUTIONS:
-• Your Prestashop server is too slow or overloaded
+• Your Prestashop server is too slow (>30s for customer list)
 • Try importing during off-peak hours (night/weekend)
 • Contact your hosting provider about server performance
 • Check if other plugins are slowing down your server
-• Consider upgrading your hosting plan"""
+• Consider upgrading your hosting plan
+• Check server logs for PHP memory/execution time limits"""
                 )
             except requests.exceptions.ConnectionError:
                 return self._create_error_report(
@@ -247,7 +320,8 @@ If still failing, check server logs for more details."""
 • Verify Prestashop URL is correct and accessible
 • Check if Prestashop server is running
 • Verify firewall/security settings
-• Test the URL manually in a browser"""
+• Test the URL manually in a browser
+• Check if server is behind a firewall or CDN"""
                 )
             
             if response.status_code != 200:
@@ -320,25 +394,54 @@ SOLUTIONS:
                     skipped_count += 1
                     continue
                 
+                # Early exit if too many consecutive errors
+                if error_count > 10 and (error_count / max(i + 1, 1)) > 0.3:
+                    _logger.error("🚨 Too many errors (%d/%d = %.1f%%), stopping import", error_count, i + 1, (error_count / (i + 1) * 100))
+                    return self._create_error_report(
+                        "❌ IMPORT STOPPED - Too Many Errors!",
+                        f"Import stopped after {i + 1} customers due to high error rate ({error_count} errors)",
+                        imported=imported_count,
+                        skipped=skipped_count,
+                        errors=error_count,
+                        context="""HIGH ERROR RATE SOLUTIONS:
+• Your Prestashop server may be overloaded or misconfigured
+• Try importing during off-peak hours
+• Check server resources (CPU, memory, database)
+• Verify API permissions are correct
+• Test connection stability first
+• Contact hosting provider about server performance"""
+                    )
+                
                 try:
-                    # Get detailed customer data with retry logic
+                    # Get detailed customer data with improved retry logic and session reuse
                     customer_detail_url = f"{test_url}/customers/{customer_id}?ws_key={self.api_key}"
+                    detail_response = None
                     
                     for attempt in range(3):  # Retry up to 3 times
                         try:
-                            detail_response = requests.get(customer_detail_url, timeout=60)
+                            # Use session for connection reuse
+                            detail_response = session.get(customer_detail_url, timeout=15)  # Reduced timeout
                             break
                         except requests.exceptions.Timeout:
+                            _logger.warning("⏱️ Timeout getting customer %s (attempt %d/3)", customer_id, attempt + 1)
                             if attempt == 2:  # Last attempt
-                                _logger.warning("Timeout getting customer %s after 3 attempts", customer_id)
                                 error_count += 1
                                 break
-                            time.sleep(5)  # Wait 5 seconds before retry
+                            time.sleep(2)  # Shorter wait between retries
                         except requests.exceptions.ConnectionError:
-                            _logger.warning("Connection error getting customer %s", customer_id)
-                            error_count += 1
-                            break
-                    else:
+                            _logger.warning("🔌 Connection error getting customer %s (attempt %d/3)", customer_id, attempt + 1)
+                            if attempt == 2:
+                                error_count += 1
+                                break
+                            time.sleep(3)  # Wait before retry on connection error
+                        except Exception as e:
+                            _logger.warning("❌ Unexpected error getting customer %s: %s", customer_id, str(e))
+                            if attempt == 2:
+                                error_count += 1
+                                break
+                            time.sleep(2)
+                    
+                    if detail_response is None:
                         continue  # Skip this customer if all retries failed
                 
                     if detail_response.status_code == 200:
@@ -394,14 +497,27 @@ SOLUTIONS:
                 
                 except Exception as e:
                     error_count += 1
-                    _logger.error("Error processing customer %s: %s", customer_id, str(e))
+                    _logger.error("💥 Error processing customer %s: %s", customer_id, str(e))
                 
-                # Progress logging every 5 customers
-                if (i + 1) % 5 == 0:
+                # More frequent progress logging and connection monitoring
+                if (i + 1) % 3 == 0:  # Every 3 customers instead of 5
                     self._log_import_progress(i + 1, len(customers), imported_count, skipped_count, error_count, "customer")
+                    
+                    # Check if we should pause due to errors
+                    if error_count > 0 and (error_count / (i + 1)) > 0.2:  # >20% error rate
+                        _logger.warning("⚠️ High error rate detected, adding longer pause...")
+                        time.sleep(2)  # Longer pause when many errors
                 
-                # Small delay to reduce server load
-                time.sleep(0.5)
+                # Shorter delay for normal operation, longer for errors
+                if error_count > 0 and (error_count / max(i + 1, 1)) > 0.1:
+                    time.sleep(1.0)  # 1 second delay when errors detected
+                else:
+                    time.sleep(0.3)  # Shorter delay for normal operation
+                
+                # Force commit every 10 customers to prevent data loss
+                if (i + 1) % 10 == 0:
+                    self.env.cr.commit()
+                    _logger.info("💾 Committed %d customers to database", i + 1)
             
             # Final report with detailed error information
             if error_count > 0:
@@ -448,7 +564,7 @@ SOLUTIONS:
             )
 
     def action_import_categories(self):
-        """Import categories from Prestashop with detailed error handling"""
+        """Import categories from Prestashop with enhanced error handling and connection management"""
         self.ensure_one()
         
         # Ensure URL ends with /api
@@ -456,17 +572,22 @@ SOLUTIONS:
         if not test_url.endswith('/api'):
             test_url += '/api'
         
+        # Create a session for connection reuse
+        session = requests.Session()
+        session.headers.update({'User-Agent': 'Odoo-Prestashop-Importer/1.0'})
+        
         imported_count = 0
         skipped_count = 0
         error_count = 0
         
         try:
-            # Get categories from Prestashop with reduced timeout and limit
+            # Get categories from Prestashop with optimized timeout and limit
             categories_url = f"{test_url}/categories?ws_key={self.api_key}&limit=20"
-            _logger.info("Starting category import from: %s", categories_url)
+            _logger.info("🚀 Starting category import from: %s", categories_url)
             
             try:
-                response = requests.get(categories_url, timeout=30)
+                response = session.get(categories_url, timeout=30)  # Using session for connection reuse
+                _logger.info("✅ Successfully got category list in %.2f seconds", response.elapsed.total_seconds())
             except requests.exceptions.Timeout:
                 return self._create_error_report(
                     "❌ TIMEOUT ERROR - Category Import Failed",
@@ -652,7 +773,7 @@ SOLUTIONS:
             )
 
     def action_import_products(self):
-        """Import products from Prestashop with detailed error handling"""
+        """Import products from Prestashop with enhanced error handling and connection management"""
         self.ensure_one()
         
         # Ensure URL ends with /api
@@ -660,25 +781,33 @@ SOLUTIONS:
         if not test_url.endswith('/api'):
             test_url += '/api'
         
+        # Create a session for connection reuse
+        session = requests.Session()
+        session.headers.update({'User-Agent': 'Odoo-Prestashop-Importer/1.0'})
+        
         imported_count = 0
         skipped_count = 0
         error_count = 0
         
         try:
-            # Get products from Prestashop
+            # Get products from Prestashop with optimized timeout
             products_url = f"{test_url}/products?ws_key={self.api_key}&limit=30"
-            _logger.info("Starting product import from: %s", products_url)
+            _logger.info("🚀 Starting product import from: %s", products_url)
             
             try:
-                response = requests.get(products_url, timeout=90)
+                response = session.get(products_url, timeout=30)  # Reduced to 30 seconds
+                _logger.info("✅ Successfully got product list in %.2f seconds", response.elapsed.total_seconds())
             except requests.exceptions.Timeout:
                 return self._create_error_report(
                     "❌ TIMEOUT ERROR - Product Import Failed",
-                    "Connection timeout while getting product list (>90 seconds)",
+                    "Connection timeout while getting product list (>30 seconds)",
                     context="""TIMEOUT SOLUTIONS:
-• Your Prestashop server is too slow or overloaded
-• Try importing during off-peak hours
-• Contact your hosting provider about server performance"""
+• Your Prestashop server is too slow (>30s for product list)
+• Try importing during off-peak hours (night/weekend)
+• Contact your hosting provider about server performance
+• Check if other plugins are slowing down your server
+• Consider upgrading your hosting plan
+• Check server logs for PHP memory/execution time limits"""
                 )
             except requests.exceptions.ConnectionError:
                 return self._create_error_report(
@@ -686,15 +815,32 @@ SOLUTIONS:
                     "Cannot connect to Prestashop server",
                     context="""CONNECTION SOLUTIONS:
 • Check your internet connection
-• Verify Prestashop URL and server status
-• Test connection first"""
+• Verify Prestashop URL is correct and accessible
+• Check if Prestashop server is running
+• Verify firewall/security settings
+• Test the URL manually in a browser
+• Check if server is behind a firewall or CDN"""
                 )
             
             if response.status_code != 200:
                 return self._create_error_report(
                     "❌ HTTP ERROR - Product Import Failed",
-                    f"Failed to get products: HTTP {response.status_code}",
-                    context="Check API key permissions and server status"
+                    f"Prestashop API returned HTTP {response.status_code}",
+                    context=f"""HTTP ERROR DETAILS:
+Status Code: {response.status_code}
+Response: {response.text[:500]}...
+
+COMMON HTTP ERRORS:
+• 401 Unauthorized: Invalid API key
+• 403 Forbidden: API key lacks permissions for products
+• 404 Not Found: Wrong URL or API endpoint
+• 500 Server Error: Prestashop server problem
+• 503 Service Unavailable: Server overloaded
+
+SOLUTIONS:
+• Check API key in Prestashop admin
+• Verify webservice permissions for products
+• Test connection first"""
                 )
             
             # Parse XML response
@@ -704,9 +850,34 @@ SOLUTIONS:
             except ET.ParseError as e:
                 return self._create_error_report(
                     "❌ XML PARSE ERROR - Product Import Failed",
-                    f"Invalid XML response for products: {str(e)}",
-                    context="Check server configuration and API endpoint"
+                    f"Invalid XML response from Prestashop API: {str(e)}",
+                    context=f"""XML ERROR DETAILS:
+The server returned invalid XML data.
+
+POSSIBLE CAUSES:
+• Server returned HTML instead of XML (check .htaccess)
+• Server error or crash during request
+• API endpoint not properly configured
+• Memory or timeout issues on Prestashop server
+
+SOLUTIONS:
+• Check Prestashop .htaccess file configuration
+• Verify webservice is enabled in Prestashop admin
+• Check server error logs
+• Test API endpoint manually in browser"""
                 )
+            
+            if not products:
+                return {
+                    'type': 'ir.actions.client',
+                    'tag': 'display_notification',
+                    'params': {
+                        'title': '⚠️ No Products Found!',
+                        'message': 'No products were found in your Prestashop store.\n\nPossible reasons:\n- Store has no products yet\n- API permissions are limited\n- Connection or server issues\n\nCheck your Prestashop admin panel to verify products exist.',
+                        'type': 'warning',
+                        'sticky': True,
+                    }
+                }
             
             _logger.info("Found %d products to process", len(products))
             
@@ -719,98 +890,155 @@ SOLUTIONS:
                     skipped_count += 1
                     continue
                 
+                # Early exit if too many consecutive errors
+                if error_count > 10 and (error_count / max(i + 1, 1)) > 0.3:
+                    _logger.error("🚨 Too many errors (%d/%d = %.1f%%), stopping import", error_count, i + 1, (error_count / (i + 1) * 100))
+                    return self._create_error_report(
+                        "❌ IMPORT STOPPED - Too Many Errors!",
+                        f"Import stopped after {i + 1} products due to high error rate ({error_count} errors)",
+                        imported=imported_count,
+                        skipped=skipped_count,
+                        errors=error_count,
+                        context="""HIGH ERROR RATE SOLUTIONS:
+• Your Prestashop server may be overloaded or misconfigured
+• Try importing during off-peak hours
+• Check server resources (CPU, memory, database)
+• Verify API permissions are correct for products
+• Test connection stability first
+• Contact hosting provider about server performance"""
+                    )
+                
                 try:
-                    # Get detailed product data with timeout handling and retry
+                    # Get detailed product data with improved retry logic and session reuse
                     product_detail_url = f"{test_url}/products/{product_id}?ws_key={self.api_key}"
+                    detail_response = None
                     
                     for attempt in range(3):  # Retry up to 3 times
                         try:
-                            detail_response = requests.get(product_detail_url, timeout=60)
+                            # Use session for connection reuse
+                            detail_response = session.get(product_detail_url, timeout=15)  # Reduced timeout
                             break
                         except requests.exceptions.Timeout:
-                            if attempt == 2:
-                                _logger.warning("Timeout getting product %s after 3 attempts", product_id)
+                            _logger.warning("⏱️ Timeout getting product %s (attempt %d/3)", product_id, attempt + 1)
+                            if attempt == 2:  # Last attempt
                                 error_count += 1
                                 break
-                            time.sleep(5)
+                            time.sleep(2)  # Shorter wait between retries
                         except requests.exceptions.ConnectionError:
-                            _logger.warning("Connection error getting product %s", product_id)
-                            error_count += 1
-                            break
-                    else:
-                        continue
+                            _logger.warning("🔌 Connection error getting product %s (attempt %d/3)", product_id, attempt + 1)
+                            if attempt == 2:
+                                error_count += 1
+                                break
+                            time.sleep(3)  # Wait before retry on connection error
+                        except Exception as e:
+                            _logger.warning("❌ Unexpected error getting product %s: %s", product_id, str(e))
+                            if attempt == 2:
+                                error_count += 1
+                                break
+                            time.sleep(2)
                     
+                    if detail_response is None:
+                        continue  # Skip this product if all retries failed
+                
                     if detail_response.status_code == 200:
                         try:
                             detail_root = ET.fromstring(detail_response.content)
                             product_element = detail_root.find('.//product')
                             
                             if product_element is not None:
-                                # Extract product data
+                                # Extract product data with improved parsing
                                 name_elem = product_element.find('.//name/language')
                                 if name_elem is None:
                                     name_elem = product_element.find('name')
                                 
                                 price_elem = product_element.find('price')
                                 reference_elem = product_element.find('reference')
+                                active_elem = product_element.find('active')
                                 
-                                name_text = name_elem.text if name_elem is not None else f'Product {product_id}'
-                                price_text = price_elem.text if price_elem is not None else '0'
-                                reference_text = reference_elem.text if reference_elem is not None else ''
+                                name_text = name_elem.text if name_elem is not None and name_elem.text else f'Product {product_id}'
+                                price_text = price_elem.text if price_elem is not None and price_elem.text else '0'
+                                reference_text = reference_elem.text if reference_elem is not None and reference_elem.text else ''
+                                active_text = active_elem.text if active_elem is not None else '1'
+                                
+                                # Clean and validate name
+                                name_text = name_text.strip()
+                                if not name_text or name_text == '':
+                                    name_text = f'Product {product_id}'
                                 
                                 if name_text:
-                                    # Check if product already exists
-                                    existing_product = product_model.search([
-                                        '|',
-                                        ('name', '=', name_text),
-                                        ('default_code', '=', reference_text)
-                                    ], limit=1)
+                                    # Check if product already exists by reference or name
+                                    domain = []
+                                    if reference_text:
+                                        domain.append(('default_code', '=', reference_text))
+                                    else:
+                                        domain.append(('name', '=', name_text))
+                                    
+                                    existing_product = product_model.search(domain, limit=1)
                                     
                                     if not existing_product:
-                                        product_vals = {
-                                            'name': name_text,
-                                            'type': 'product',
-                                            'sale_ok': True,
-                                            'purchase_ok': True,
-                                            'default_code': reference_text,
-                                        }
-                                        
-                                        # Set price with validation
                                         try:
-                                            price_value = float(price_text) if price_text else 0.0
-                                            product_vals['list_price'] = max(0.0, price_value)
-                                        except (ValueError, TypeError):
-                                            product_vals['list_price'] = 0.0
-                                        
-                                        product_obj = product_model.create(product_vals)
-                                        imported_count += 1
-                                        _logger.info("Created product: %s (Prestashop ID: %s)", product_obj.name, product_id)
+                                            product_vals = {
+                                                'name': name_text,
+                                                'type': 'consu',  # Changed from 'product' to 'consu' for Odoo 18
+                                                'sale_ok': True,
+                                                'purchase_ok': True,
+                                                'default_code': reference_text or f'PS_{product_id}',
+                                                'active': active_text == '1',
+                                            }
+                                            
+                                            # Set price with validation
+                                            try:
+                                                price_value = float(price_text) if price_text else 0.0
+                                                product_vals['list_price'] = max(0.0, price_value)
+                                            except (ValueError, TypeError):
+                                                product_vals['list_price'] = 0.0
+                                                _logger.warning("Invalid price for product %s: %s", product_id, price_text)
+                                            
+                                            product_obj = product_model.create(product_vals)
+                                            imported_count += 1
+                                            _logger.info("✅ Created product: %s (Prestashop ID: %s)", product_obj.name, product_id)
+                                        except Exception as create_error:
+                                            error_count += 1
+                                            _logger.error("❌ Failed to create product %s: %s", product_id, str(create_error))
                                     else:
                                         skipped_count += 1
                                         _logger.debug("Product already exists: %s", name_text)
                                 else:
                                     error_count += 1
-                                    _logger.warning("Product %s has no name", product_id)
+                                    _logger.warning("Product %s has no valid name", product_id)
                             else:
                                 error_count += 1
                                 _logger.warning("No product data found for ID %s", product_id)
-                        except ET.ParseError:
+                        except ET.ParseError as xml_error:
                             error_count += 1
-                            _logger.warning("Invalid XML for product %s", product_id)
+                            _logger.warning("Invalid XML for product %s: %s", product_id, str(xml_error))
                     else:
                         error_count += 1
                         _logger.warning("Failed to get product %s: HTTP %s", product_id, detail_response.status_code)
                 
                 except Exception as e:
                     error_count += 1
-                    _logger.error("Error processing product %s: %s", product_id, str(e))
+                    _logger.error("💥 Error processing product %s: %s", product_id, str(e))
                 
-                # Progress logging every 5 products
-                if (i + 1) % 5 == 0:
+                # More frequent progress logging and connection monitoring
+                if (i + 1) % 3 == 0:  # Every 3 products instead of 5
                     self._log_import_progress(i + 1, len(products), imported_count, skipped_count, error_count, "product")
+                    
+                    # Check if we should pause due to errors
+                    if error_count > 0 and (error_count / (i + 1)) > 0.2:  # >20% error rate
+                        _logger.warning("⚠️ High error rate detected, adding longer pause...")
+                        time.sleep(2)  # Longer pause when many errors
                 
-                # Small delay to reduce server load
-                time.sleep(0.5)
+                # Shorter delay for normal operation, longer for errors
+                if error_count > 0 and (error_count / max(i + 1, 1)) > 0.1:
+                    time.sleep(1.0)  # 1 second delay when errors detected
+                else:
+                    time.sleep(0.3)  # Shorter delay for normal operation
+                
+                # Force commit every 10 products to prevent data loss
+                if (i + 1) % 10 == 0:
+                    self.env.cr.commit()
+                    _logger.info("💾 Committed %d products to database", i + 1)
             
             # Final report with detailed error information
             if error_count > 0:
@@ -820,7 +1048,22 @@ SOLUTIONS:
                     imported=imported_count,
                     skipped=skipped_count,
                     errors=error_count,
-                    context="Common issues: Missing product data, price errors, or category problems."
+                    context="""COMMON PRODUCT IMPORT ISSUES:
+• Missing or invalid product names
+• Price format errors (non-numeric values)
+• Empty or null product data from Prestashop
+• Server timeout or connection issues
+• API permissions missing for products
+• XML parsing errors from malformed responses
+• Product type compatibility (Odoo 18 uses 'consu' for goods instead of 'product')
+
+SOLUTIONS:
+• Check product data quality in Prestashop admin
+• Verify all products have valid names and prices
+• Test connection stability first
+• Check server logs for detailed errors
+• Ensure API key has full product permissions
+• Update module for Odoo version compatibility"""
                 )
             elif imported_count == 0:
                 return self._create_error_report(
@@ -829,7 +1072,18 @@ SOLUTIONS:
                     imported=imported_count,
                     skipped=skipped_count,
                     errors=error_count,
-                    context="Possible issues: All products already exist, connection problems, or no valid products found."
+                    context="""POSSIBLE CAUSES:
+• All products already exist in Odoo
+• No valid products found in Prestashop
+• Connection or API permission issues
+• Server problems preventing product access
+• Product data quality issues (missing names/prices)
+
+TROUBLESHOOTING:
+• Check if products exist in Prestashop admin
+• Verify API key has product permissions
+• Test connection first
+• Check server logs for errors"""
                 )
             else:
                 return {
@@ -847,6 +1101,254 @@ SOLUTIONS:
             _logger.error("Product import failed: %s", str(e))
             return self._create_error_report(
                 "💥 CRITICAL ERROR - Product Import Failed!",
+                f"Import process crashed with error: {str(e)}",
+                context="""CRITICAL ERROR SOLUTIONS:
+• Check internet connection
+• Verify Prestashop URL and API key
+• Test connection first
+• Check server logs for technical details
+• Contact system administrator if problem persists"""
+            )
+
+    def action_import_customer_groups(self):
+        """Import customer groups as pricelists from Prestashop with detailed error handling"""
+        self.ensure_one()
+        
+        # Ensure URL ends with /api
+        test_url = self.prestashop_url.rstrip('/')
+        if not test_url.endswith('/api'):
+            test_url += '/api'
+        
+        try:
+            # Get customer groups from Prestashop using direct HTTP call
+            groups_url = f"{test_url}/groups?ws_key={self.api_key}"
+            _logger.info("Starting customer groups import from: %s", groups_url)
+            
+            try:
+                response = requests.get(groups_url, timeout=90)
+            except requests.exceptions.Timeout:
+                return self._create_error_report(
+                    "❌ TIMEOUT ERROR - Customer Groups Import Failed",
+                    "Connection timeout while getting customer groups (>90 seconds)",
+                    context="""TIMEOUT SOLUTIONS:
+• Your Prestashop server is too slow or overloaded
+• Try importing during off-peak hours (night/weekend)  
+• Contact your hosting provider about server performance
+• Check if other plugins are slowing down your server
+• Consider upgrading your hosting plan"""
+                )
+            except requests.exceptions.ConnectionError:
+                return self._create_error_report(
+                    "❌ CONNECTION ERROR - Customer Groups Import Failed",
+                    "Cannot connect to Prestashop server",
+                    context="""CONNECTION SOLUTIONS:
+• Check your internet connection
+• Verify Prestashop URL is correct and accessible
+• Check if Prestashop server is running
+• Verify firewall/security settings
+• Test the URL manually in a browser"""
+                )
+            
+            if response.status_code != 200:
+                return self._create_error_report(
+                    "❌ HTTP ERROR - Customer Groups Import Failed",
+                    f"Prestashop API returned HTTP {response.status_code}",
+                    context=f"""HTTP ERROR DETAILS:
+Status Code: {response.status_code}
+Response: {response.text[:500]}...
+
+COMMON HTTP ERRORS:
+• 401 Unauthorized: Invalid API key
+• 403 Forbidden: API key lacks permissions
+• 404 Not Found: Wrong URL or API endpoint  
+• 500 Server Error: Prestashop server problem
+• 503 Service Unavailable: Server overloaded
+
+SOLUTIONS:
+• Check API key in Prestashop admin
+• Verify webservice permissions for groups
+• Test connection first"""
+                )
+            
+            # Parse XML response
+            try:
+                root = ET.fromstring(response.content)
+                groups = root.findall('.//group')
+            except ET.ParseError as e:
+                return self._create_error_report(
+                    "❌ XML PARSE ERROR - Customer Groups Import Failed",
+                    f"Invalid XML response from Prestashop API: {str(e)}",
+                    context=f"""XML ERROR DETAILS:
+The server returned invalid XML data.
+
+POSSIBLE CAUSES:
+• Server returned HTML instead of XML (check .htaccess)
+• Server error or crash during request
+• API endpoint not properly configured
+• Memory or timeout issues on Prestashop server
+
+SOLUTIONS:
+• Check Prestashop .htaccess file configuration
+• Verify webservice is enabled in Prestashop admin
+• Check server error logs
+• Test API endpoint manually in browser"""
+                )
+            
+            if not groups:
+                return {
+                    'type': 'ir.actions.client',
+                    'tag': 'display_notification',
+                    'params': {
+                        'title': '⚠️ No Customer Groups Found!',
+                        'message': 'No customer groups were found in your Prestashop store.\n\nPossible reasons:\n- Store has no custom customer groups\n- API permissions are limited\n- Connection or server issues\n\nCheck your Prestashop admin panel to verify groups exist.',
+                        'type': 'warning',
+                        'sticky': True,
+                    }
+                }
+            
+            imported_count = 0
+            skipped_count = 0
+            error_count = 0
+            pricelist_model = self.env['product.pricelist']
+            
+            _logger.info("Found %d customer groups to process", len(groups))
+            
+            for i, group in enumerate(groups):
+                group_id = group.get('id')
+                if not group_id:
+                    skipped_count += 1
+                    continue
+                
+                try:
+                    # Get detailed group data with retry logic
+                    group_detail_url = f"{test_url}/groups/{group_id}?ws_key={self.api_key}"
+                    
+                    for attempt in range(3):  # Retry up to 3 times
+                        try:
+                            detail_response = requests.get(group_detail_url, timeout=60)
+                            break
+                        except requests.exceptions.Timeout:
+                            if attempt == 2:  # Last attempt
+                                _logger.warning("Timeout getting group %s after 3 attempts", group_id)
+                                error_count += 1
+                                break
+                            time.sleep(5)  # Wait 5 seconds before retry
+                        except requests.exceptions.ConnectionError:
+                            _logger.warning("Connection error getting group %s", group_id)
+                            error_count += 1
+                            break
+                    else:
+                        continue  # Skip this group if all retries failed
+                    
+                    if detail_response.status_code == 200:
+                        try:
+                            detail_root = ET.fromstring(detail_response.content)
+                            group_element = detail_root.find('.//group')
+                            
+                            if group_element is not None:
+                                # Extract group data
+                                name_elem = group_element.find('.//name/language')
+                                if name_elem is None:
+                                    name_elem = group_element.find('name')
+                                
+                                reduction_elem = group_element.find('reduction')
+                                
+                                name_text = name_elem.text if name_elem is not None else f'Group {group_id}'
+                                reduction_text = reduction_elem.text if reduction_elem is not None else '0'
+                                
+                                if name_text:
+                                    # Check if pricelist already exists
+                                    existing_pricelist = pricelist_model.search([
+                                        ('name', '=', f"Prestashop - {name_text}"),
+                                    ], limit=1)
+                                    
+                                    if not existing_pricelist:
+                                        # Create pricelist based on customer group
+                                        pricelist_vals = {
+                                            'name': f"Prestashop - {name_text}",
+                                            'active': True,
+                                            'company_id': self.company_id.id,
+                                            'currency_id': self.env.company.currency_id.id,
+                                        }
+                                        
+                                        # Get discount rate if available
+                                        try:
+                                            discount = float(reduction_text) if reduction_text else 0
+                                        except (ValueError, TypeError):
+                                            discount = 0
+                                        
+                                        if discount > 0:
+                                            pricelist_vals['item_ids'] = [(0, 0, {
+                                                'applied_on': '3_global',
+                                                'compute_price': 'percentage',
+                                                'percent_price': discount,
+                                            })]
+                                        
+                                        pricelist = pricelist_model.create(pricelist_vals)
+                                        imported_count += 1
+                                        _logger.info("Created pricelist: %s (Prestashop Group ID: %s)", pricelist.name, group_id)
+                                    else:
+                                        skipped_count += 1
+                                        _logger.debug("Pricelist already exists: %s", name_text)
+                                else:
+                                    skipped_count += 1
+                                    _logger.warning("Group %s has no name", group_id)
+                            else:
+                                error_count += 1
+                                _logger.warning("No group data found for ID %s", group_id)
+                        except ET.ParseError:
+                            error_count += 1
+                            _logger.warning("Invalid XML for group %s", group_id)
+                    else:
+                        error_count += 1
+                        _logger.warning("Failed to get group %s: HTTP %s", group_id, detail_response.status_code)
+                
+                except Exception as e:
+                    error_count += 1
+                    _logger.error("Error processing group %s: %s", group_id, str(e))
+                
+                # Progress logging every 3 groups (they're usually fewer than customers)
+                if (i + 1) % 3 == 0:
+                    self._log_import_progress(i + 1, len(groups), imported_count, skipped_count, error_count, "customer group")
+                
+                # Small delay to reduce server load
+                time.sleep(0.3)
+            
+            # Final report with detailed error information
+            if error_count > 0:
+                return self._create_error_report(
+                    "⚠️ Customer Groups Import Completed with ERRORS!",
+                    f"Import process completed but encountered {error_count} errors",
+                    imported=imported_count,
+                    skipped=skipped_count,
+                    errors=error_count,
+                    context="Check server logs for detailed error information."
+                )
+            elif imported_count == 0:
+                return self._create_error_report(
+                    "⚠️ No Customer Groups Imported!",
+                    "No new pricelists were created during import",
+                    imported=imported_count,
+                    skipped=skipped_count,
+                    errors=error_count,
+                    context="Possible issues: All groups already exist as pricelists, server problems, or API permissions."
+                )
+            else:
+                return {
+                    'type': 'ir.actions.client',
+                    'tag': 'display_notification',
+                    'params': {
+                        'title': '✅ Customer Groups Import Successful!',
+                        'message': f'Import completed successfully!\n\n• Imported: {imported_count} new pricelists\n• Skipped: {skipped_count} (already exist)',
+                        'type': 'success',
+                        'sticky': False,
+                    }
+                }
+            
+        except Exception as e:
+            _logger.error("Customer groups import failed: %s", str(e))
+            return self._create_error_report(
+                "💥 CRITICAL ERROR - Customer Groups Import Failed!",
                 f"Import process crashed with error: {str(e)}",
                 context="""CRITICAL ERROR SOLUTIONS:
 • Check internet connection
