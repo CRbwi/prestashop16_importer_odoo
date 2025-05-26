@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <data>
+
+        <!-- List View -->
+        <record id="view_prestashop16_backend_tree" model="ir.ui.view">
+            <field name="name">prestashop16.backend.list</field>
+            <field name="model">prestashop16.backend</field>
+            <field name="type">list</field>
+            <field name="arch" type="xml">
+                <list string="Prestashop Backends">
+                    <field name="sequence" widget="handle"/>
+                    <field name="name"/>
+                    <field name="prestashop_url"/>
+                    <field name="company_id" groups="base.group_multi_company"/>
+                    <field name="active" widget="boolean_toggle"/>
+                </list>
+            </field>
+        </record>
+
+        <!-- Form View -->
+        <record id="view_prestashop16_backend_form" model="ir.ui.view">
+            <field name="name">prestashop16.backend.form</field>
+            <field name="model">prestashop16.backend</field>
+            <field name="type">form</field>
+            <field name="arch" type="xml">
+                <form string="Prestashop Backend">
+                    <header>
+                         <button name="action_test_connection" type="object" string="Test Connection" class="oe_highlight"/>
+                         <button name="action_test_url_manually" type="object" string="Test URL Only" class="btn-secondary"/>
+                         <button name="action_import_customer_groups" type="object" string="Import Customer Groups" class="oe_highlight" help="Import Prestashop Customer Groups as Odoo Pricelists"/>
+                         <button name="action_import_customers" type="object" string="Import Customers &amp; Addresses" class="oe_highlight"/>
+                         <button name="action_import_categories" type="object" string="Import Categories" class="oe_highlight" help="Import Prestashop Categories"/>
+                         <button name="action_import_products" type="object" string="Import Products" class="oe_highlight" help="Import Prestashop Products"/>
+                    </header>
+                    <sheet>
+                        <widget name="web_ribbon" title="Archived" bg_color="bg-danger" invisible="active"/>
+                        <group name="main_config">
+                            <group>
+                                <field name="name"/>
+                                <field name="prestashop_url" placeholder="e.g., http://yourstore.com/api"/>
+                                <field name="api_key" password="True"/>
+                            </group>
+                            <group>
+                                <field name="active" invisible="1"/>
+                                <field name="company_id" groups="base.group_multi_company"/>
+                                <field name="sequence" invisible="1"/>
+                            </group>
+                        </group>
+                        <notebook>
+                            <page string="Import Status" name="import_status">
+                                <group>
+                                    <field name="id" string="Last Import Status (Placeholder)"/>
+                                    <!-- TODO: Add fields to track last import dates, counts, etc. -->
+                                </group>
+                            </page>
+                            <page string="Advanced Configuration" name="advanced_config">
+                                <group>
+                                    <field name="id" string="Advanced Options (Placeholder)"/>
+                                    <!-- TODO: Add fields for specific import options if needed -->
+                                </group>
+                            </page>
+                        </notebook>
+                    </sheet>
+                </form>
+            </field>
+        </record>
+
+        <!-- Action -->
+        <record id="action_prestashop16_backend" model="ir.actions.act_window">
+            <field name="name">Prestashop 1.6 Backends</field>
+            <field name="res_model">prestashop16.backend</field>
+            <field name="view_mode">list,form</field>
+            <field name="help" type="html">
+                <p class="o_view_nocontent_smiling_face">
+                    Configure a new Prestashop 1.6 Backend connection.
+                </p><p>
+                    This will allow you to import data from your Prestashop store.
+                </p>
+            </field>
+        </record>
+
+    </data>
+</odoo>

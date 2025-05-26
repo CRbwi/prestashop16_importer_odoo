@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <data>
+        <!-- Main Importer Menu -->
+        <menuitem
+            id="menu_prestashop_importer_root"
+            name="Prestashop 1.6 Importer"
+            sequence="90"
+            web_icon="prestashop16_importer,static/description/icon.png"
+            groups="base.group_system"/> <!-- Or a more specific group -->
+
+        <menuitem
+            id="menu_prestashop_importer_backends"
+            name="Backend Configuration"
+            parent="menu_prestashop_importer_root"
+            action="action_prestashop16_backend"
+            sequence="10"/>
+
+        <!-- You can add more submenus here for specific import actions or logs if needed -->
+
+    </data>
+</odoo>
