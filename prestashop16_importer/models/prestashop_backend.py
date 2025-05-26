@@ -5,6 +5,7 @@ import logging
 import requests
 import xml.etree.ElementTree as ET
 import time
+import base64
 
 _logger = logging.getLogger(__name__)
 
@@ -25,6 +26,29 @@ class PrestashopBackend(models.Model):
         index=True,
         help="Company related to this Prestashop instance."
     )
+
+    def _safe_database_operation(self, operation_func, operation_name="database operation"):
+        """
+        Safely execute database operations with transaction error handling
+        This prevents psycopg2.errors.InFailedSqlTransaction errors
+        """
+        try:
+            return operation_func()
+        except Exception as e:
+            _logger.error("❌ Failed %s: %s", operation_name, str(e))
+            # Check if it's a transaction error
+            if 'InFailedSqlTransaction' in str(e) or 'transaction is aborted' in str(e):
+                _logger.warning("🔄 Transaction error detected, attempting recovery...")
+                try:
+                    # Force a rollback to clean state
+                    self.env.cr.rollback()
+                    # Try the operation again
+                    return operation_func()
+                except Exception as retry_error:
+                    _logger.error("❌ Retry also failed for %s: %s", operation_name, str(retry_error))
+                    raise retry_error
+            else:
+                raise e
 
     def _create_error_report(self, title, main_error, imported=0, skipped=0, errors=0, context=""):
         """Helper method to create detailed error notifications with enhanced debugging info"""
@@ -291,6 +315,16 @@ RewriteRule ^api/?(.*)$ webservice/dispatcher.php?url=$1 [QSA,L]"""
         session = requests.Session()
         session.headers.update({'User-Agent': 'Odoo-Prestashop-Importer/1.0'})
         
+        # Disable mail tracking and computed fields during import to prevent transaction errors
+        context = dict(self.env.context)
+        context.update({
+            'tracking_disable': True,
+            'mail_create_nolog': True,
+            'mail_create_nosubscribe': True,
+            'mail_auto_subscribe_no_notify': True,
+            'no_reset_password': True,
+        })
+        
         try:
             # Get customers list with shorter, more realistic timeout
             customers_url = f"{test_url}/customers?ws_key={self.api_key}"
@@ -384,7 +418,7 @@ SOLUTIONS:
             imported_count = 0
             skipped_count = 0
             error_count = 0
-            partner_model = self.env['res.partner']
+            partner_model = self.env['res.partner'].with_context(context)
             
             _logger.info("Found %d customers to process", len(customers))
             
@@ -467,18 +501,25 @@ SOLUTIONS:
                                     ], limit=1)
                                     
                                     if not existing_partner:
-                                        # Create customer
-                                        partner_vals = {
-                                            'name': f"{firstname_text} {lastname_text}".strip() or email_text,
-                                            'email': email_text,
-                                            'is_company': False,
-                                            'customer_rank': 1,
-                                            'comment': f"Imported from Prestashop (ID: {customer_id})",
-                                        }
+                                        # Create customer with proper error handling
+                                        def create_customer():
+                                            partner_vals = {
+                                                'name': f"{firstname_text} {lastname_text}".strip() or email_text,
+                                                'email': email_text,
+                                                'is_company': False,
+                                                'customer_rank': 1,
+                                                'comment': f"Imported from Prestashop (ID: {customer_id})",
+                                            }
+                                            return partner_model.create(partner_vals)
                                         
-                                        partner = partner_model.create(partner_vals)
-                                        imported_count += 1
-                                        _logger.info("Created customer: %s (Prestashop ID: %s)", partner.name, customer_id)
+                                        try:
+                                            partner = self._safe_database_operation(create_customer, f"customer creation {customer_id}")
+                                            imported_count += 1
+                                            _logger.info("Created customer: %s (Prestashop ID: %s)", partner.name, customer_id)
+                                        except Exception as create_error:
+                                            error_count += 1
+                                            _logger.error("Failed to create customer %s: %s", customer_id, str(create_error))
+                                            # Continue processing other customers instead of aborting
                                     else:
                                         skipped_count += 1
                                         _logger.debug("Customer already exists: %s", email_text)
@@ -514,10 +555,14 @@ SOLUTIONS:
                 else:
                     time.sleep(0.3)  # Shorter delay for normal operation
                 
-                # Force commit every 10 customers to prevent data loss
+                # Progress logging every 10 customers (with proper transaction handling)
                 if (i + 1) % 10 == 0:
-                    self.env.cr.commit()
-                    _logger.info("💾 Committed %d customers to database", i + 1)
+                    _logger.info("💾 Processed %d customers so far", i + 1)
+                    # Force a transaction savepoint to prevent corruption
+                    try:
+                        self.env.cr.flush()
+                    except Exception as flush_error:
+                        _logger.warning("Transaction flush issue (non-critical): %s", str(flush_error))
             
             # Final report with detailed error information
             if error_count > 0:
@@ -575,6 +620,14 @@ SOLUTIONS:
         # Create a session for connection reuse
         session = requests.Session()
         session.headers.update({'User-Agent': 'Odoo-Prestashop-Importer/1.0'})
+        
+        # Disable mail tracking and computed fields during import to prevent transaction errors
+        context = dict(self.env.context)
+        context.update({
+            'tracking_disable': True,
+            'mail_create_nolog': True,
+            'mail_create_nosubscribe': True,
+        })
         
         imported_count = 0
         skipped_count = 0
@@ -635,13 +688,72 @@ SOLUTIONS:
             
             _logger.info("Found %d categories to process", len(categories))
             
-            category_model = self.env['product.category']
+            # Create a session for reuse in category hierarchy processing
+            category_model = self.env['product.category'].with_context(context)
             
-            for i, category in enumerate(categories):
+            # First, collect all category data to establish proper import order
+            categories_to_process = []
+            categories_data = {}
+            
+            for category in categories:
                 category_id = category.get('id')
                 if not category_id or category_id in ['1', '2']:  # Skip root categories
                     skipped_count += 1
                     continue
+                    
+                try:
+                    # Get detailed category data
+                    category_detail_url = f"{test_url}/categories/{category_id}?ws_key={self.api_key}"
+                    detail_response = session.get(category_detail_url, timeout=15)
+                    
+                    if detail_response.status_code == 200:
+                        detail_root = ET.fromstring(detail_response.content)
+                        category_element = detail_root.find('.//category')
+                        
+                        if category_element is not None:
+                            name_elem = category_element.find('.//name/language')
+                            if name_elem is None:
+                                name_elem = category_element.find('name')
+                            
+                            parent_elem = category_element.find('id_parent')
+                            
+                            name_text = name_elem.text if name_elem is not None else f'Category {category_id}'
+                            parent_id = parent_elem.text if parent_elem is not None else None
+                            
+                            if name_text and name_text.strip():
+                                categories_data[category_id] = {
+                                    'name': name_text.strip(),
+                                    'parent_id': parent_id,
+                                    'prestashop_id': category_id
+                                }
+                                categories_to_process.append(category_id)
+                                _logger.debug("📁 Collected category: %s (Parent: %s)", name_text, parent_id)
+                except Exception as e:
+                    _logger.warning("❌ Error collecting data for category %s: %s", category_id, str(e))
+                    error_count += 1
+            
+            _logger.info("🔄 Collected %d categories, now processing in hierarchy order...", len(categories_to_process))
+            
+            # Sort categories to process parents before children when possible
+            def get_depth_level(cat_id, depth=0):
+                """Calculate category depth to sort parents first"""
+                if depth > 10:  # Prevent infinite recursion
+                    return depth
+                if cat_id not in categories_data:
+                    return depth
+                parent_id = categories_data[cat_id].get('parent_id')
+                if not parent_id or parent_id in ['0', '1', '2']:
+                    return depth
+                if parent_id in categories_data:
+                    return get_depth_level(parent_id, depth + 1)
+                return depth
+            
+            # Sort by depth (parents first)
+            categories_to_process.sort(key=lambda x: get_depth_level(x))
+            
+            # Process categories in order
+            for i, category_id in enumerate(categories_to_process):
+                cat_data = categories_data[category_id]
                 
                 # Early exit if too many errors
                 if error_count > 5:
@@ -649,81 +761,82 @@ SOLUTIONS:
                     break
                 
                 try:
-                    # Get detailed category data with reduced timeout
-                    category_detail_url = f"{test_url}/categories/{category_id}?ws_key={self.api_key}"
+                    name_text = cat_data['name']
+                    parent_id = cat_data['parent_id']
                     
-                    # Reduced retries for faster processing
-                    for attempt in range(2):  # Only 2 attempts instead of 3
-                        try:
-                            detail_response = requests.get(category_detail_url, timeout=15)
-                            break
-                        except requests.exceptions.Timeout:
-                            if attempt == 1:
-                                _logger.warning("Timeout getting category %s after 2 attempts", category_id)
-                                error_count += 1
-                                break
-                            time.sleep(2)
-                        except requests.exceptions.ConnectionError:
-                            _logger.warning("Connection error getting category %s", category_id)
-                            error_count += 1
-                            break
-                    else:
-                        continue
+                    # Check if category already exists
+                    existing_category = category_model.search([
+                        ('name', '=', name_text),
+                    ], limit=1)
                     
-                    if detail_response.status_code == 200:
-                        try:
-                            detail_root = ET.fromstring(detail_response.content)
-                            category_element = detail_root.find('.//category')
+                    if not existing_category:
+                        def create_category():
+                            category_vals = {
+                                'name': name_text.strip(),
+                            }
                             
-                            if category_element is not None:
-                                # Extract category data
-                                name_elem = category_element.find('.//name/language')
-                                if name_elem is None:
-                                    name_elem = category_element.find('name')
-                                
-                                name_text = name_elem.text if name_elem is not None else f'Category {category_id}'
-                                
-                                if name_text and name_text.strip():
-                                    # Check if category already exists
-                                    existing_category = category_model.search([
-                                        ('name', '=', name_text),
-                                    ], limit=1)
+                            # Handle parent category hierarchy
+                            if parent_id and parent_id != '0' and parent_id not in ['1', '2']:
+                                try:
+                                    # First try to find existing parent by getting its data from Prestashop
+                                    parent_detail_url = f"{test_url}/categories/{parent_id}?ws_key={self.api_key}"
+                                    parent_response = session.get(parent_detail_url, timeout=10)
                                     
-                                    if not existing_category:
-                                        try:
-                                            category_vals = {
-                                                'name': name_text.strip(),
-                                            }
+                                    if parent_response.status_code == 200:
+                                        parent_root = ET.fromstring(parent_response.content)
+                                        parent_element = parent_root.find('.//category')
+                                        
+                                        if parent_element is not None:
+                                            parent_name_elem = parent_element.find('.//name/language')
+                                            if parent_name_elem is None:
+                                                parent_name_elem = parent_element.find('name')
                                             
-                                            category_obj = category_model.create(category_vals)
-                                            imported_count += 1
-                                            _logger.info("Created category: %s (Prestashop ID: %s)", category_obj.name, category_id)
-                                        except Exception as create_error:
-                                            _logger.error("Error creating category %s: %s", category_id, str(create_error))
-                                            error_count += 1
-                                    else:
-                                        skipped_count += 1
-                                        _logger.debug("Category already exists: %s", name_text)
-                                else:
-                                    error_count += 1
-                                    _logger.warning("Category %s has no valid name", category_id)
-                            else:
-                                error_count += 1
-                                _logger.warning("No category data found for ID %s", category_id)
-                        except ET.ParseError:
+                                            if parent_name_elem is not None:
+                                                parent_name = parent_name_elem.text.strip()
+                                                
+                                                # Search for existing parent category
+                                                parent_category = category_model.search([
+                                                    ('name', '=', parent_name)
+                                                ], limit=1)
+                                                
+                                                if parent_category:
+                                                    category_vals['parent_id'] = parent_category.id
+                                                    _logger.debug("🔗 Found parent category: %s for %s", parent_name, name_text)
+                                                else:
+                                                    # Parent doesn't exist, create it first
+                                                    parent_vals = {'name': parent_name}
+                                                    parent_category = category_model.create(parent_vals)
+                                                    category_vals['parent_id'] = parent_category.id
+                                                    _logger.info("✅ Created parent category: %s (for %s)", parent_name, name_text)
+                                except Exception as parent_error:
+                                    _logger.warning("⚠️ Could not process parent category %s for %s: %s", parent_id, name_text, str(parent_error))
+                            
+                            return category_model.create(category_vals)
+                        
+                        try:
+                            category_obj = self._safe_database_operation(create_category, f"category creation {category_id}")
+                            imported_count += 1
+                            
+                            hierarchy_info = ""
+                            if category_obj.parent_id:
+                                hierarchy_info = f" (under {category_obj.parent_id.name})"
+                            
+                            _logger.info("✅ Created category: %s%s (Prestashop ID: %s)", 
+                                       category_obj.name, hierarchy_info, category_id)
+                        except Exception as create_error:
+                            _logger.error("Error creating category %s: %s", category_id, str(create_error))
                             error_count += 1
-                            _logger.warning("Invalid XML for category %s", category_id)
                     else:
-                        error_count += 1
-                        _logger.warning("Failed to get category %s: HTTP %s", category_id, detail_response.status_code)
-                
+                        skipped_count += 1
+                        _logger.debug("Category already exists: %s", name_text)
+                                        
                 except Exception as e:
                     error_count += 1
                     _logger.error("Error processing category %s: %s", category_id, str(e))
                 
                 # Progress logging every 3 categories
                 if (i + 1) % 3 == 0:
-                    self._log_import_progress(i + 1, len(categories), imported_count, skipped_count, error_count, "category")
+                    self._log_import_progress(i + 1, len(categories_to_process), imported_count, skipped_count, error_count, "category")
                 
                 # Shorter delay to speed up processing
                 time.sleep(0.1)
@@ -784,6 +897,16 @@ SOLUTIONS:
         # Create a session for connection reuse
         session = requests.Session()
         session.headers.update({'User-Agent': 'Odoo-Prestashop-Importer/1.0'})
+        
+        # Disable mail tracking and computed fields during import to prevent transaction errors
+        context = dict(self.env.context)
+        context.update({
+            'tracking_disable': True,
+            'mail_create_nolog': True,
+            'mail_create_nosubscribe': True,
+            'mail_auto_subscribe_no_notify': True,
+            'import_mode': True,  # Signal that we're in import mode
+        })
         
         imported_count = 0
         skipped_count = 0
@@ -881,8 +1004,8 @@ SOLUTIONS:
             
             _logger.info("Found %d products to process", len(products))
             
-            product_model = self.env['product.template']
-            category_model = self.env['product.category']
+            product_model = self.env['product.template'].with_context(context)
+            category_model = self.env['product.category'].with_context(context)
             
             for i, product in enumerate(products):
                 product_id = product.get('id')
@@ -946,7 +1069,7 @@ SOLUTIONS:
                             product_element = detail_root.find('.//product')
                             
                             if product_element is not None:
-                                # Extract product data with improved parsing
+                                # Extract product data with comprehensive parsing
                                 name_elem = product_element.find('.//name/language')
                                 if name_elem is None:
                                     name_elem = product_element.find('name')
@@ -954,11 +1077,37 @@ SOLUTIONS:
                                 price_elem = product_element.find('price')
                                 reference_elem = product_element.find('reference')
                                 active_elem = product_element.find('active')
+                                description_elem = product_element.find('.//description/language')
+                                if description_elem is None:
+                                    description_elem = product_element.find('description')
+                                description_short_elem = product_element.find('.//description_short/language')
+                                if description_short_elem is None:
+                                    description_short_elem = product_element.find('description_short')
+                                
+                                # Extract categories
+                                categories_elem = product_element.find('associations/categories')
+                                category_ids = []
+                                if categories_elem is not None:
+                                    for cat in categories_elem.findall('category'):
+                                        cat_id = cat.find('id')
+                                        if cat_id is not None and cat_id.text:
+                                            category_ids.append(cat_id.text)
+                                
+                                # Extract images
+                                images_elem = product_element.find('associations/images')
+                                image_ids = []
+                                if images_elem is not None:
+                                    for img in images_elem.findall('image'):
+                                        img_id = img.find('id')
+                                        if img_id is not None and img_id.text:
+                                            image_ids.append(img_id.text)
                                 
                                 name_text = name_elem.text if name_elem is not None and name_elem.text else f'Product {product_id}'
                                 price_text = price_elem.text if price_elem is not None and price_elem.text else '0'
                                 reference_text = reference_elem.text if reference_elem is not None and reference_elem.text else ''
                                 active_text = active_elem.text if active_elem is not None else '1'
+                                description_text = description_elem.text if description_elem is not None and description_elem.text else ''
+                                description_short_text = description_short_elem.text if description_short_elem is not None and description_short_elem.text else ''
                                 
                                 # Clean and validate name
                                 name_text = name_text.strip()
@@ -977,26 +1126,53 @@ SOLUTIONS:
                                     
                                     if not existing_product:
                                         try:
-                                            product_vals = {
-                                                'name': name_text,
-                                                'type': 'consu',  # Changed from 'product' to 'consu' for Odoo 18
-                                                'sale_ok': True,
-                                                'purchase_ok': True,
-                                                'default_code': reference_text or f'PS_{product_id}',
-                                                'active': active_text == '1',
-                                            }
+                                            # Process categories for this product
+                                            odoo_category_ids = []
+                                            if category_ids:
+                                                odoo_category_ids = self._get_or_create_categories(category_ids, session, test_url)
                                             
-                                            # Set price with validation
-                                            try:
-                                                price_value = float(price_text) if price_text else 0.0
-                                                product_vals['list_price'] = max(0.0, price_value)
-                                            except (ValueError, TypeError):
-                                                product_vals['list_price'] = 0.0
-                                                _logger.warning("Invalid price for product %s: %s", product_id, price_text)
+                                            def create_product():
+                                                product_vals = {
+                                                    'name': name_text,
+                                                    'type': 'consu',  # Changed from 'product' to 'consu' for Odoo 18
+                                                    'sale_ok': True,
+                                                    'purchase_ok': True,
+                                                    'default_code': reference_text or f'PS_{product_id}',
+                                                    'active': active_text == '1',
+                                                    'description': description_text[:2000] if description_text else '',  # Limit description length
+                                                    'description_sale': description_short_text[:1000] if description_short_text else '',
+                                                }
+                                                
+                                                # Assign categories
+                                                if odoo_category_ids:
+                                                    # Use the first category as main category, others as additional
+                                                    product_vals['categ_id'] = odoo_category_ids[0]
+                                                    if len(odoo_category_ids) > 1:
+                                                        product_vals['public_categ_ids'] = [(6, 0, odoo_category_ids)]
+                                                
+                                                # Set price with validation
+                                                try:
+                                                    price_value = float(price_text) if price_text else 0.0
+                                                    product_vals['list_price'] = max(0.0, price_value)
+                                                except (ValueError, TypeError):
+                                                    product_vals['list_price'] = 0.0
+                                                    _logger.warning("Invalid price for product %s: %s", product_id, price_text)
+                                                
+                                                return product_model.create(product_vals)
                                             
-                                            product_obj = product_model.create(product_vals)
+                                            product_obj = self._safe_database_operation(create_product, f"product creation {product_id}")
+                                            
+                                            # Import product images with transaction safety
+                                            if image_ids:
+                                                try:
+                                                    self._import_product_images(product_obj, product_id, image_ids, session, test_url)
+                                                except Exception as img_error:
+                                                    _logger.warning("⚠️ Failed to import images for product %s: %s", product_id, str(img_error))
+                                                    # Continue with product creation even if images fail
+                                            
                                             imported_count += 1
-                                            _logger.info("✅ Created product: %s (Prestashop ID: %s)", product_obj.name, product_id)
+                                            _logger.info("✅ Created product: %s (Prestashop ID: %s) with %d categories and %d images", 
+                                                       product_obj.name, product_id, len(odoo_category_ids), len(image_ids))
                                         except Exception as create_error:
                                             error_count += 1
                                             _logger.error("❌ Failed to create product %s: %s", product_id, str(create_error))
@@ -1035,10 +1211,9 @@ SOLUTIONS:
                 else:
                     time.sleep(0.3)  # Shorter delay for normal operation
                 
-                # Force commit every 10 products to prevent data loss
+                # Progress logging every 10 products (removed manual commits to prevent transaction errors)
                 if (i + 1) % 10 == 0:
-                    self.env.cr.commit()
-                    _logger.info("💾 Committed %d products to database", i + 1)
+                    _logger.info("💾 Processed %d products so far", i + 1)
             
             # Final report with detailed error information
             if error_count > 0:
@@ -1357,3 +1532,208 @@ SOLUTIONS:
 • Check server logs for technical details
 • Contact system administrator if problem persists"""
             )
+
+    def _get_or_create_categories(self, category_ids, session, test_url):
+        """Get or create Odoo categories from Prestashop category IDs with hierarchy support"""
+        if not category_ids:
+            return []
+        
+        category_model = self.env['product.category']
+        odoo_category_ids = []
+        
+        # Dictionary to store category data and hierarchy
+        categories_data = {}
+        
+        _logger.info("🏷️ Processing %d categories for product", len(category_ids))
+        
+        # First pass: Get all category data from Prestashop
+        for cat_id in category_ids:
+            if cat_id in ['1', '2']:  # Skip root categories
+                continue
+                
+            try:
+                # Get category details from Prestashop
+                category_detail_url = f"{test_url}/categories/{cat_id}?ws_key={self.api_key}"
+                response = session.get(category_detail_url, timeout=10)
+                
+                if response.status_code == 200:
+                    detail_root = ET.fromstring(response.content)
+                    category_element = detail_root.find('.//category')
+                    
+                    if category_element is not None:
+                        # Extract category data
+                        name_elem = category_element.find('.//name/language')
+                        if name_elem is None:
+                            name_elem = category_element.find('name')
+                        
+                        parent_elem = category_element.find('id_parent')
+                        
+                        name_text = name_elem.text if name_elem is not None else f'Category {cat_id}'
+                        parent_id = parent_elem.text if parent_elem is not None else None
+                        
+                        # Store category data
+                        categories_data[cat_id] = {
+                            'name': name_text.strip(),
+                            'parent_id': parent_id,
+                            'prestashop_id': cat_id
+                        }
+                        
+                        _logger.debug("📁 Found category: %s (Parent: %s)", name_text, parent_id)
+                    else:
+                        _logger.warning("No category data found for ID %s", cat_id)
+                else:
+                    _logger.warning("Failed to get category %s: HTTP %s", cat_id, response.status_code)
+                    
+            except Exception as e:
+                _logger.error("Error getting category %s data: %s", cat_id, str(e))
+                
+        # Second pass: Create categories with proper hierarchy
+        created_categories = {}
+        
+        def create_category_with_parent(cat_id, cat_data):
+            """Recursively create category and its parent if needed"""
+            if cat_id in created_categories:
+                return created_categories[cat_id]
+            
+            # Check if category already exists in Odoo
+            existing_category = category_model.search([
+                ('name', '=', cat_data['name'])
+            ], limit=1)
+            
+            if existing_category:
+                created_categories[cat_id] = existing_category.id
+                _logger.debug("✅ Category exists: %s", cat_data['name'])
+                return existing_category.id
+            
+            # Prepare category values
+            category_vals = {
+                'name': cat_data['name'],
+            }
+            
+            # Handle parent category
+            parent_id = cat_data.get('parent_id')
+            if parent_id and parent_id != '0' and parent_id not in ['1', '2']:
+                # Check if parent exists in our data
+                if parent_id in categories_data:
+                    # Recursively create parent first
+                    parent_odoo_id = create_category_with_parent(parent_id, categories_data[parent_id])
+                    if parent_odoo_id:
+                        category_vals['parent_id'] = parent_odoo_id
+                        _logger.debug("🔗 Setting parent for %s: %s", cat_data['name'], categories_data[parent_id]['name'])
+                else:
+                    # Try to find parent by name or create a basic one
+                    parent_category = category_model.search([
+                        ('name', 'ilike', f'%{parent_id}%')
+                    ], limit=1)
+                    if parent_category:
+                        category_vals['parent_id'] = parent_category.id
+            
+            try:
+                # Create the category
+                category_obj = category_model.create(category_vals)
+                created_categories[cat_id] = category_obj.id
+                
+                hierarchy_info = ""
+                if 'parent_id' in category_vals:
+                    parent_name = category_model.browse(category_vals['parent_id']).name
+                    hierarchy_info = f" (under {parent_name})"
+                
+                _logger.info("✅ Created category: %s%s (Prestashop ID: %s)", 
+                           category_obj.name, hierarchy_info, cat_id)
+                
+                return category_obj.id
+                
+            except Exception as create_error:
+                _logger.error("❌ Failed to create category %s: %s", cat_data['name'], str(create_error))
+                return None
+        
+        # Create all categories with hierarchy
+        for cat_id, cat_data in categories_data.items():
+            odoo_id = create_category_with_parent(cat_id, cat_data)
+            if odoo_id:
+                odoo_category_ids.append(odoo_id)
+        
+        _logger.info("🎯 Successfully processed %d categories for product assignment", len(odoo_category_ids))
+        return odoo_category_ids
+
+    def _import_product_images(self, product_obj, product_id, image_ids, session, test_url):
+        """Import product images from Prestashop"""
+        if not image_ids:
+            return
+        
+        _logger.info("🖼️ Processing %d images for product %s", len(image_ids), product_obj.name)
+        
+        imported_count = 0
+        error_count = 0
+        
+        # Process each image
+        for i, img_id in enumerate(image_ids):
+            try:
+                # Get image URL from Prestashop API
+                # Prestashop 1.6 image URL format: /api/images/products/{product_id}/{image_id}
+                image_url = f"{test_url}/images/products/{product_id}/{img_id}?ws_key={self.api_key}"
+                
+                _logger.debug("📥 Downloading image %s from: %s", img_id, image_url)
+                
+                # Download the image
+                response = session.get(image_url, timeout=30)
+                
+                if response.status_code == 200:
+                    # Validate that we got actual image data
+                    content_type = response.headers.get('content-type', '').lower()
+                    if any(img_type in content_type for img_type in ['image/', 'jpeg', 'png', 'gif', 'webp']):
+                        
+                        # Convert image to base64
+                        import base64
+                        image_data = base64.b64encode(response.content).decode('utf-8')
+                        
+                        try:
+                            if i == 0:
+                                # First image becomes the main product image
+                                product_obj.write({'image_1920': image_data})
+                                _logger.info("✅ Set main image for product %s (Prestashop Image ID: %s)", 
+                                           product_obj.name, img_id)
+                                imported_count += 1
+                            else:
+                                # Additional images go to product images
+                                # Note: In Odoo 18, we can use product.image model for additional images
+                                if hasattr(self.env, 'product.image'):
+                                    self.env['product.image'].create({
+                                        'name': f'Prestashop Image {img_id}',
+                                        'image_1920': image_data,
+                                        'product_tmpl_id': product_obj.id,
+                                    })
+                                    _logger.info("✅ Added additional image for product %s (Prestashop Image ID: %s)", 
+                                               product_obj.name, img_id)
+                                    imported_count += 1
+                                else:
+                                    # Fallback: just set as main image if product.image not available
+                                    if not product_obj.image_1920:
+                                        product_obj.write({'image_1920': image_data})
+                                        imported_count += 1
+                                        
+                        except Exception as save_error:
+                            error_count += 1
+                            _logger.error("❌ Failed to save image %s for product %s: %s", 
+                                        img_id, product_obj.name, str(save_error))
+                    else:
+                        error_count += 1
+                        _logger.warning("⚠️ Invalid image format for image %s (Content-Type: %s)", 
+                                      img_id, content_type)
+                else:
+                    error_count += 1
+                    _logger.warning("❌ Failed to download image %s: HTTP %s", img_id, response.status_code)
+                    
+            except Exception as e:
+                error_count += 1
+                _logger.error("💥 Error processing image %s for product %s: %s", 
+                            img_id, product_obj.name, str(e))
+            
+            # Small delay between image downloads to avoid overwhelming the server
+            if i < len(image_ids) - 1:  # Don't delay after the last image
+                time.sleep(0.5)
+        
+        if imported_count > 0:
+            _logger.info("🎉 Successfully imported %d images for product %s", imported_count, product_obj.name)
+        if error_count > 0:
+            _logger.warning("⚠️ Failed to import %d images for product %s", error_count, product_obj.name)
